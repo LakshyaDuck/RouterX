@@ -5,30 +5,33 @@ Supports environment variable DATABASE_URL for deployment (e.g. Render, Railway,
 
 import os
 from typing import Generator, Optional
-from sqlmodel import SQLModel, create_engine, Session, select
 
-from app.models import (
-    Vehicle, Delivery, Node, Road, Route, Event,
-    SimulationMetadata, FleetState
+from sqlmodel import Session, SQLModel, create_engine, select
+
+from app_settings import settings
+from models import (
+    Delivery,
+    Event,
+    FleetState,
+    Node,
+    Road,
+    Route,
+    SimulationMetadata,
+    Vehicle,
 )
 
 # ---------------------------------------------------------------------------
 # Database URL configuration
 # ---------------------------------------------------------------------------
 
-DEFAULT_PG_URL = "postgresql://postgres:postgres@127.0.0.1:5432/fleet_db"
-DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_PG_URL)
+DATABASE_URL = os.getenv("DATABASE_URL") or settings.postgres_dsn
 
 # Normalize legacy postgres:// prefix (common on Heroku/Render) to postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Connection engine with pre-ping to ensure active connection
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True
-)
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -42,9 +45,16 @@ def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     try:
         from sqlalchemy import text
+
         with engine.connect() as conn:
-            conn.execute(text("ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'TIME_WINDOW_CHANGE'"))
-            conn.execute(text("ALTER TYPE vehiclestatus ADD VALUE IF NOT EXISTS 'NOTACTIVATED'"))
+            conn.execute(
+                text(
+                    "ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'TIME_WINDOW_CHANGE'"
+                )
+            )
+            conn.execute(
+                text("ALTER TYPE vehiclestatus ADD VALUE IF NOT EXISTS 'NOTACTIVATED'")
+            )
             conn.commit()
     except Exception:
         pass
@@ -54,8 +64,10 @@ def init_db() -> None:
 # State Query & Persistence Helpers
 # ---------------------------------------------------------------------------
 
+
 def has_fleet_data(session: Optional[Session] = None) -> bool:
     """Check if vehicles/deliveries are already seeded in the database."""
+
     def _check(s: Session) -> bool:
         stmt = select(Vehicle).limit(1)
         return s.exec(stmt).first() is not None
@@ -75,6 +87,7 @@ def save_initial_fleet_state(
     session: Optional[Session] = None,
 ) -> None:
     """Seed initial fleet state into PostgreSQL."""
+
     def _save(s: Session) -> None:
         for n in nodes:
             s.merge(n)
@@ -100,6 +113,7 @@ def save_initial_fleet_state(
 
 def get_fleet_state(session: Optional[Session] = None) -> FleetState:
     """Retrieve full fleet state from PostgreSQL."""
+
     def _query(s: Session) -> FleetState:
         vehicles = list(s.exec(select(Vehicle)).all())
         deliveries = list(s.exec(select(Delivery)).all())
