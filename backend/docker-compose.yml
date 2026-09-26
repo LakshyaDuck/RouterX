@@ -1,0 +1,87 @@
+name: vrp-backend
+
+services:
+  # ── Postgres + PostGIS ────────────────────────────────────────────────
+  # Regular postgres image doesn't have the PostGIS extension compiled in.
+  # postgis/postgis bundles it so `CREATE EXTENSION postgis;` works day one.
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vrp
+      POSTGRES_PASSWORD: vrp_local_dev
+      POSTGRES_DB: vrp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # runs once on first init only — enables the extension automatically
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      # depends_on below waits for THIS to pass, not just container start
+      test: ["CMD-SHELL", "pg_isready -U vrp -d vrp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis ─────────────────────────────────────────────────────────────
+  # Doubles as: (1) Redis Streams for ordered event ingestion,
+  # (2) hot solver-working-state cache, (3) arq task queue broker.
+  # One instance, three uses — no reason to run three separate services.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── FastAPI app + solver + arq worker share one image ────────────────
+  # Same codebase, two entrypoints (see Dockerfile CMD vs. the worker
+  # override below) — no reason to duplicate the image build.
+  api:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      # bind-mount for live-reload during dev; drop this in prod
+      - ./app:/app
+
+  # ── Background worker: runs the OR-Tools solver off the request thread ─
+  # Same image as `api`, different command. This is what stops a 2-second
+  # warm-start repair from blocking an HTTP worker (see prior discussion).
+  worker:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["uv", "run", "arq", "worker.WorkerSettings"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/app
+
+volumes:
+  pgdata:
+  redisdata:
