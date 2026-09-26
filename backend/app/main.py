@@ -46,6 +46,18 @@ app.add_middleware(
 )
 
 
+# engine comes from database.py — one engine shared by the API process, the
+# arq worker, and Alembic. Defining a second engine here meant /health could
+# report on a different database than the routes actually used.
+redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+
+
+# ── Home page contract ──────────────────────────────────────────────────
+# The frontend is a separate app with its own build and deploy, so it renders
+# this payload itself rather than the API shipping markup. Treat it as a
+# contract: adding a field is safe, renaming or removing one is breaking.
+
+
 class HomeLink(BaseModel):
     """One link the home page can render — nav, cards, or a button row."""
 
@@ -138,28 +150,40 @@ def fleet_state(session: Session = Depends(get_session)) -> FleetState:
     return get_fleet_state(session)
 
 
-# engine now comes from database.py — one engine shared by the API, the arq
-# worker, and Alembic. Two engines meant /health could report on a different
-# database than the routes actually used.
-redis_client = redis.from_url(settings.redis_url, decode_responses=True)
-
-
 @app.get("/health", tags=["health"])
 async def health():
     """
-    Checks every local dependency this system needs — Postgres+PostGIS,
-    Redis — so a docker compose misconfiguration surfaces here instead
-    of as a confusing failure three layers deep later.
+    Checks every dependency this system needs — Postgres, Redis — so a bad
+    connection string surfaces here instead of as a confusing failure three
+    layers deep later.
+
+    PostGIS is reported separately and does NOT affect `ok`. It is an optional
+    capability, not a liveness requirement: managed Postgres (Render, RDS,
+    most hosted offerings) ships without the extension, and nothing in the
+    code requires it — models.py stores coordinates as plain lat/lon floats.
+    Folding it into `ok` would report a perfectly healthy deployment as broken.
     """
     checks = {}
 
-    # Postgres + PostGIS
+    # Postgres
+    try:
+        with Session(engine) as session:
+            session.exec(text("SELECT 1")).first()
+            checks["postgres"] = {"ok": True}
+    except Exception as e:
+        checks["postgres"] = {"ok": False, "error": str(e)}
+
+    # PostGIS — optional capability, excluded from the `ok` rollup below.
     try:
         with Session(engine) as session:
             version = session.exec(text("SELECT PostGIS_Version()")).first()
-            checks["postgis"] = {"ok": True, "version": version[0] if version else None}
+            checks["postgis"] = {
+                "ok": True,
+                "required": False,
+                "version": version[0] if version else None,
+            }
     except Exception as e:
-        checks["postgis"] = {"ok": False, "error": str(e)}
+        checks["postgis"] = {"ok": False, "required": False, "error": str(e)}
 
     # Redis
     try:
@@ -168,7 +192,7 @@ async def health():
     except Exception as e:
         checks["redis"] = {"ok": False, "error": str(e)}
 
-    all_ok = all(c.get("ok") for c in checks.values())
+    all_ok = all(c.get("ok") for c in checks.values() if c.get("required", True))
     return {"ok": all_ok, "checks": checks}
 
 
@@ -196,7 +220,8 @@ async def stream_events():
 
 @app.on_event("startup")
 async def on_startup():
-    # Creates tables from SQLModel metadata if they don't exist yet.
-    # Once you have real models + Alembic migrations, this line goes away
-    # entirely — Alembic becomes the only thing that touches schema.
+    # Delegates to database.init_db(), which creates tables from SQLModel
+    # metadata and syncs the Postgres enum types. Once Alembic owns the
+    # schema, this goes away entirely — Alembic becomes the only thing that
+    # touches it.
     init_db()

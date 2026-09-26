@@ -26,9 +26,16 @@ from models import (
 
 DATABASE_URL = os.getenv("DATABASE_URL") or settings.postgres_dsn
 
-# Normalize legacy postgres:// prefix (common on Heroku/Render) to postgresql://
+# Normalize the scheme so this works with whatever URL format the host
+# injects. Render/Heroku/AWS hand out `postgres://` or a bare `postgresql://`
+# with no driver suffix, and SQLAlchemy then defaults to psycopg2 — which is
+# NOT installed here. This project is on psycopg3. Pinning the driver
+# explicitly is what keeps that from becoming a ModuleNotFoundError at
+# startup rather than a connection error.
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://") :]
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://") :]
 
 # Connection engine with pre-ping to ensure active connection
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)

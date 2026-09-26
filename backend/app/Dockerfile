@@ -33,4 +33,7 @@ EXPOSE 8000
 
 # uv run executes inside the project's locked virtualenv without needing
 # to `source .venv/bin/activate` manually.
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# ${PORT:-8000} keeps local docker compose on 8000 while honoring the port
+# Render injects. --reload is deliberately gone: it is a dev file-watcher,
+# and in production it masks real startup errors behind endless restarts.
+CMD ["sh", "-c", "uv run uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
