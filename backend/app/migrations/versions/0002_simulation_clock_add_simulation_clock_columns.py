@@ -46,35 +46,56 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _has_column(table: str, column: str) -> bool:
+    """
+    True if `table.column` is already present.
+
+    Guarded for the same reason 0001 is: a database can arrive here with the
+    column already present and no alembic_version row — the production Postgres
+    on Render was built by the old create_all startup path, and the test suite
+    builds its schema with metadata.create_all() rather than with these
+    migrations. An unguarded ADD COLUMN fails on both with
+    "column ... already exists", which is the identical failure mode 0001 was
+    just rewritten to avoid.
+    """
+    inspector = sa.inspect(op.get_bind())
+    if table not in inspector.get_table_names():
+        return False
+    return column in {c["name"] for c in inspector.get_columns(table)}
+
+
 def upgrade() -> None:
     """Add the three simulation clock columns to simulationmetadata."""
-    op.add_column(
-        "simulationmetadata",
-        sa.Column(
-            "simulation_start_time",
-            sqlmodel.sql.sqltypes.AutoString(),
-            nullable=False,
-            server_default="",
-        ),
-    )
-    op.add_column(
-        "simulationmetadata",
-        sa.Column(
-            "is_running",
-            sa.Boolean(),
-            nullable=False,
-            server_default=sa.false(),
-        ),
-    )
-    op.add_column(
-        "simulationmetadata",
-        sa.Column(
-            "speed_multiplier",
-            sa.Float(),
-            nullable=False,
-            server_default="1.0",
-        ),
-    )
+    if not _has_column("simulationmetadata", "simulation_start_time"):
+        op.add_column(
+            "simulationmetadata",
+            sa.Column(
+                "simulation_start_time",
+                sqlmodel.sql.sqltypes.AutoString(),
+                nullable=False,
+                server_default="",
+            ),
+        )
+    if not _has_column("simulationmetadata", "is_running"):
+        op.add_column(
+            "simulationmetadata",
+            sa.Column(
+                "is_running",
+                sa.Boolean(),
+                nullable=False,
+                server_default=sa.false(),
+            ),
+        )
+    if not _has_column("simulationmetadata", "speed_multiplier"):
+        op.add_column(
+            "simulationmetadata",
+            sa.Column(
+                "speed_multiplier",
+                sa.Float(),
+                nullable=False,
+                server_default="1.0",
+            ),
+        )
 
 
 def downgrade() -> None:
@@ -86,6 +107,11 @@ def downgrade() -> None:
     `simulation_start_time`/clock state permanently gone rather than
     reconstructed. It exists because a downgrade that fails halfway is worse
     than one that completes, not because anyone should run it in production.
+
+    Unguarded, unlike upgrade() here and unlike 0001's downgrade. A guarded
+    drop cannot tell "a column this revision added" from "a column that was
+    always there", and skipping either one leaves a schema that neither
+    revision describes.
     """
     op.drop_column("simulationmetadata", "speed_multiplier")
     op.drop_column("simulationmetadata", "is_running")
