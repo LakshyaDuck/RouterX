@@ -247,6 +247,22 @@ def get_fleet_state(session: Optional[Session] = None) -> FleetState:
         return _query(s)
 
 
+def build_city_graph(state: FleetState):
+    """
+    Build a routing graph from a loaded ``FleetState``.
+
+    The single seam between the database and ``routing.py``: callers that need
+    travel times hand over the state they already have rather than re-querying
+    the city, and the graph is rebuilt whenever roads change rather than being
+    mutated in place. ``CityGraph`` memoises its Dijkstra runs and assumes an
+    unchanging edge set, so a new graph per change is the intended usage — at
+    25 nodes and 45 roads it costs microseconds.
+    """
+    from routing import build_graph
+
+    return build_graph(state.nodes, state.roads)
+
+
 def get_vehicles(session: Optional[Session] = None) -> list[Vehicle]:
     if session is not None:
         return list(session.exec(select(Vehicle)).all())

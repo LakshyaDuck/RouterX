@@ -4,8 +4,8 @@ Redis, SSE push) works end-to-end. Solver logic, SQLModel schema, and
 Alembic migrations are the next layer to build on top of this.
 
 No OSRM here: this system runs against a synthetic/imaginary world, so
-travel costs are computed directly (Euclidean distance — see
-distance_matrix.py) rather than fetched from a real-road-network router.
+travel costs come from the city's own Node/Road rows via ``routing.py``
+rather than a real-road-network service.
 """
 
 import logging
