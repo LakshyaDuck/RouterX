@@ -73,25 +73,18 @@ app = FastAPI(
 )
 
 # CORS Middleware configuration
-# In production, CORS_ORIGINS can specify trusted domains, or [] if served behind same-origin reverse proxy.
-# Wildcard '*' requires allow_credentials=False per browser security standards.
-allow_all_origins = "*" in CORS_ORIGINS or len(CORS_ORIGINS) == 0
-if allow_all_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# Specifically permits the production Vercel frontend (https://router-x.vercel.app),
+# custom configured FRONTEND_URL / CORS_ORIGINS, and preview domains matching *.vercel.app.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
+)
 
 app.include_router(fleet.router)
 app.include_router(routing_router.router)
@@ -159,6 +152,50 @@ async def root_create_node(
     return await fleet.create_node(req, session)
 
 
+# Root GET aliases for clients querying without /api prefix
+@app.get("/state", response_model=fleet.FleetState)
+async def root_get_state(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/state."""
+    return await fleet.fetch_fleet_state(session)
+
+
+@app.get("/vehicles", response_model=list[fleet.Vehicle])
+async def root_get_vehicles(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/vehicles."""
+    return await fleet.fetch_vehicles(session)
+
+
+@app.get("/deliveries", response_model=list[fleet.Delivery])
+async def root_get_deliveries(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/deliveries."""
+    return await fleet.fetch_deliveries(session)
+
+
+@app.get("/routes", response_model=list[fleet.Route])
+async def root_get_routes(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/routes."""
+    return await fleet.fetch_routes(session)
+
+
+@app.get("/nodes", response_model=list[fleet.Node])
+async def root_get_nodes(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/nodes."""
+    return await fleet.fetch_nodes(session)
+
+
+@app.get("/roads", response_model=list[fleet.Road])
+async def root_get_roads(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/roads."""
+    return await fleet.fetch_roads(session)
+
+
+@app.get("/events", response_model=list[fleet.Event])
+async def root_get_events(session: fleet.Session = fleet.Depends(fleet.get_session)):
+    """Alias for GET /api/events."""
+    return await fleet.fetch_events(session)
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host=HOST, port=PORT, reload=not IS_PRODUCTION)
+

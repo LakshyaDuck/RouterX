@@ -1,7 +1,35 @@
 import axios from 'axios'
 
-const rawBase = import.meta.env.VITE_API_BASE_URL || '/api'
-const BASE = rawBase.replace(/\/+$/, '')
+// Resolve backend API URL.
+// In Vite, client-accessible env vars MUST be prefixed with VITE_.
+// Supports VITE_API_URL, VITE_API_BASE_URL, or VITE_BACKEND_URL.
+function resolveApiBase() {
+  const envUrl = (
+    import.meta.env.VITE_API_URL ||
+    import.meta.env.VITE_API_BASE_URL ||
+    import.meta.env.VITE_BACKEND_URL ||
+    ''
+  ).trim()
+
+  if (!envUrl) {
+    // Default to relative '/api' (works with Vite dev proxy and Nginx reverse proxy)
+    return '/api'
+  }
+
+  // Remove any trailing slashes
+  const clean = envUrl.replace(/\/+$/, '')
+
+  // If already ends with '/api' or is relative '/api', use directly
+  if (clean === '/api' || clean.endsWith('/api')) {
+    return clean
+  }
+
+  // If given a domain/host URL like 'https://routerx.onrender.com' or 'http://localhost:8000',
+  // append '/api' so all endpoints like `${BASE}/state` reach `${clean}/api/state`.
+  return `${clean}/api`
+}
+
+const BASE = resolveApiBase()
 
 export const api = {
   getState:     () => axios.get(`${BASE}/state`),

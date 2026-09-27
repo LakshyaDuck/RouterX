@@ -26,8 +26,9 @@ except ImportError:
 
 logger = logging.getLogger("routerx.config")
 
-# Environment identification
-ENVIRONMENT = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).lower()
+# Environment identification: checks ENVIRONMENT, ENV, or cloud flags like RENDER
+default_env = "production" if os.getenv("RENDER") else "development"
+ENVIRONMENT = os.getenv("ENVIRONMENT", os.getenv("ENV", default_env)).lower()
 IS_PRODUCTION = ENVIRONMENT in ("production", "prod")
 
 # Server configuration
@@ -77,18 +78,46 @@ AUTO_SEED_DEMO = os.getenv("AUTO_SEED_DEMO", "true").lower() in ("true", "1", "y
 
 # CORS Configuration
 def get_cors_origins() -> List[str]:
+    origins: List[str] = []
+
+    # 1. Read from FRONTEND_URL (single URL or comma-separated)
+    frontend_url = os.getenv("FRONTEND_URL", "").strip()
+    if frontend_url:
+        for u in frontend_url.split(","):
+            clean_u = u.strip().rstrip("/")
+            if clean_u and clean_u not in origins:
+                origins.append(clean_u)
+
+    # 2. Read from CORS_ORIGINS (comma-separated list)
     cors_str = os.getenv("CORS_ORIGINS", "").strip()
     if cors_str:
-        return [orig.strip() for orig in cors_str.split(",") if orig.strip()]
-    if IS_PRODUCTION:
-        return []
-    return [
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-    ]
+        for u in cors_str.split(","):
+            clean_u = u.strip().rstrip("/")
+            if clean_u and clean_u not in origins:
+                origins.append(clean_u)
+
+    # 3. Always include the production Vercel frontend domain
+    prod_vercel = "https://router-x.vercel.app"
+    if prod_vercel not in origins:
+        origins.append(prod_vercel)
+
+    # 4. In development mode, include standard local dev server origins
+    if not IS_PRODUCTION:
+        dev_origins = [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+        ]
+        for dev in dev_origins:
+            if dev not in origins:
+                origins.append(dev)
+
+    return origins
+
 
 CORS_ORIGINS = get_cors_origins()
