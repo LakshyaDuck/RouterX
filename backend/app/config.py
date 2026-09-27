@@ -61,11 +61,27 @@ if not _raw_db_url:
             ENVIRONMENT
         )
 
-# Normalize legacy postgres:// prefix (common on Heroku, Render, AWS) to postgresql://
-if _raw_db_url.startswith("postgres://"):
-    _raw_db_url = _raw_db_url.replace("postgres://", "postgresql://", 1)
+def normalize_database_url(url: str) -> str:
+    """
+    Normalizes database URL:
+    - Replaces legacy postgres:// scheme with postgresql://
+    - Detects whether psycopg (v3) or psycopg2 is available in the environment.
+      If psycopg (v3) is available and no dialect is explicitly specified, uses postgresql+psycopg://.
+    """
+    if not url:
+        return url
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
 
-DATABASE_URL = _raw_db_url
+    if url.startswith("postgresql://"):
+        try:
+            import psycopg  # noqa: F401
+            return "postgresql+psycopg://" + url[len("postgresql://"):]
+        except ImportError:
+            return url
+    return url
+
+DATABASE_URL = normalize_database_url(_raw_db_url)
 
 # Connection pool settings
 DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
