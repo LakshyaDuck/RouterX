@@ -8,6 +8,7 @@ travel costs are computed directly (Euclidean distance — see
 distance_matrix.py) rather than fetched from a real-road-network router.
 """
 
+import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -19,14 +20,40 @@ from pydantic import BaseModel
 from sqlmodel import Session, text
 
 from app_settings import settings
-from database import engine, get_fleet_state, get_session, init_db
+from database import (
+    engine,
+    get_fleet_state,
+    get_session,
+    init_db,
+    seed_fleet_state,
+)
 from models import FleetState
+
+logger = logging.getLogger(__name__)
+
+# Emit this module's INFO records. Python's root logger defaults to WARNING, so
+# without this the startup lines below are silently dropped and the one question
+# anyone asks during setup — "did it seed?" — has no visible answer.
+#
+# Deliberately NOT `logging.basicConfig(level=logging.INFO)`. That sets the ROOT
+# logger, which turns on every third-party INFO logger too: Alembic alone emits
+# nine "setup plugin ..." lines per boot, burying the two messages that matter.
+# A handler on this module's logger is the narrow version — our records are
+# visible, everyone else's verbosity is unchanged. `propagate = False` keeps
+# uvicorn's own logging setup from double-printing them if it later installs a
+# root handler.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+logger.setLevel(logging.INFO)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Startup: apply migrations, then hand over to the request handlers.
+    Startup: apply migrations, seed an empty database, then serve.
 
     A lifespan handler rather than `@app.on_event("startup")`, which FastAPI has
     deprecated. Beyond the warning, the difference that matters is ordering
@@ -34,10 +61,31 @@ async def lifespan(app: FastAPI):
     are easy to end up running after the first request is already being served,
     whereas everything here completes before the app accepts traffic.
 
+    Both steps must finish before the first request. A client that fetched
+    /fleet/state while seeding was half-done would get a partial fleet and no
+    error to tell it so.
+
     init_db() runs the Alembic chain. It is the only thing that touches the
-    schema — see its docstring for why create_all was removed.
+    schema — see its docstring for why create_all was removed. Seeding runs
+    after it, because it needs the tables to exist.
     """
     init_db()
+
+    if settings.seed_demo_data:
+        try:
+            seeded = seed_fleet_state()
+        except Exception:
+            # A failed seed must not stop the API from starting. The failure is
+            # already visible in /health (postgres ok) and on the dashboard
+            # (empty fleet); taking the whole service down would additionally
+            # hide the health endpoint that would have explained it. The
+            # traceback still goes to the logs, which is where the detail
+            # belongs.
+            logger.exception("demo scenario seeding failed; continuing with an empty fleet")
+        else:
+            if seeded:
+                logger.info("seeded demo scenario into an empty database")
+
     yield
     # Nothing to tear down: the SQLAlchemy engine pools connections and is
     # process-scoped, and the Redis client is closed by its own GC. Both would

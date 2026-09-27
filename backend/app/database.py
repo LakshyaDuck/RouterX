@@ -142,6 +142,82 @@ def save_initial_fleet_state(
             _save(s)
 
 
+def seed_fleet_state(session: Optional[Session] = None) -> bool:
+    """
+    Insert the deterministic demo scenario if — and only if — the fleet is empty.
+
+    Returns True if data was written, False if the database already had a fleet.
+
+    Two properties this is careful about:
+
+      * It never overwrites. `has_fleet_data()` is checked first, and the whole
+        write goes through `save_initial_fleet_state`, which merges by primary
+        key. Seeding is a bootstrap step, not a reset — restarting the API
+        against a database that a user has been experimenting on must not
+        silently restore the demo city over their changes. That is what
+        `make reset-db` and the Phase 5/6 simulation endpoints are for.
+
+      * It validates before it writes. `validate_demo_scenario()` returning
+        non-empty raises rather than seeding. A half-valid scenario is worse
+        than an unseeded one: the check exists precisely because the failure
+        mode of hand-authored fixture data is a database that seeds cleanly and
+        is subtly wrong, and a raise at bootstrap is the last cheap moment to
+        notice.
+
+    One empty Route per vehicle is seeded alongside, rather than waiting for the
+    optimizer in Phase 3 to create them. Route.vehicle_id is the primary key, so
+    "one route per vehicle" is a 1:1 invariant that holds from the first commit
+    rather than from whenever the optimizer happened to land. The rows are
+    zeroed placeholders — no stops, no distance — and Phase 3 overwrites them
+    with a real plan. Seeding none would leave `/fleet/state` reporting
+    `routes: []` for a phase, which reads as "the optimizer found nothing"
+    rather than "the optimizer does not exist yet".
+    """
+    from demo_scenario import (
+        build_demo_deliveries,
+        build_demo_nodes,
+        build_demo_roads,
+        build_demo_vehicles,
+        validate_demo_scenario,
+    )
+
+    problems = validate_demo_scenario()
+    if problems:
+        raise ValueError(
+            "demo scenario failed validation, refusing to seed:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    def _seed(s: Session) -> bool:
+        if has_fleet_data(s):
+            return False
+        vehicles = build_demo_vehicles()
+        save_initial_fleet_state(
+            vehicles=vehicles,
+            deliveries=build_demo_deliveries(),
+            nodes=build_demo_nodes(),
+            roads=build_demo_roads(),
+            routes=[
+                Route(
+                    vehicle_id=vehicle.id,
+                    delivery_ids=[],
+                    total_distance=0.0,
+                    total_travel_time=0.0,
+                    total_load=0.0,
+                    feasible=True,
+                )
+                for vehicle in vehicles
+            ],
+            session=s,
+        )
+        return True
+
+    if session is not None:
+        return _seed(session)
+    with Session(engine) as s:
+        return _seed(s)
+
+
 def get_fleet_state(session: Optional[Session] = None) -> FleetState:
     """Retrieve full fleet state from PostgreSQL."""
 

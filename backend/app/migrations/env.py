@@ -3,20 +3,48 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-# Pulls the DSN from the same Settings object main.py and worker.py use —
-# so a docker-compose env change updates migrations too, no duplicated
-# connection string sitting in alembic.ini to drift out of sync.
-from app_settings import settings
+# Import the app's RESOLVED database URL, not settings.postgres_dsn directly.
+#
+# database.py computes DATABASE_URL as `os.getenv("DATABASE_URL") or
+# settings.postgres_dsn` and then normalises the driver. Reading settings here
+# instead created two independent answers to "which database?", which disagree
+# the moment DATABASE_URL is set and POSTGRES_DSN is not — a configuration
+# Render and Railway both hand out. The result is the worst version of this
+# class of bug: the app connects to database A while `alembic upgrade head`
+# quietly migrates database B, and the schema the app sees never changes.
+#
+# One resolver, one answer, and the tests' DSN override reaches migrations too.
+from database import DATABASE_URL
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.postgres_dsn)
+config.set_main_option("sqlalchemy.url", DATABASE_URL)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
+#
+# disable_existing_loggers=False is load-bearing, and omitting it is a silent,
+# app-wide failure that is very hard to see from the symptom.
+#
+# logging.config.fileConfig defaults to disable_existing_loggers=True: every
+# logger that already exists and is NOT named in alembic.ini gets
+# `disabled = True`. Because database.init_db() runs the migration chain
+# in-process at startup, that reaches loggers this file has never heard of —
+# uvicorn.error, uvicorn.access, and the app's own module logger.
+#
+# What it looks like: the server boots, applies migrations, seeds correctly, and
+# serves every request — and then logs nothing more. Not one access log, no
+# "Application startup complete", no startup or error output. The application is
+# working perfectly and is completely invisible. The only reason this is caught
+# at all is that a missing access log is noticeable; had the last line uvicorn
+# emits been something nobody would look for, it would have shipped.
+#
+# Passing False keeps alembic.ini's own logger configuration (so `alembic
+# upgrade` from a terminal still logs as it always did) without silencing
+# anyone else.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Import the model modules so their tables are registered in `metadata` before
 # `context.configure` diffs against it.
