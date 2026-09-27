@@ -21,13 +21,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # needing network access to a package index at all if the wheel cache
 # already has them from a previous build.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 # ── App code layer ────────────────────────────────────────────────────────
 COPY . .
 
-# Now install the project itself (fast — deps are already resolved above)
-RUN uv sync --frozen
+# Now install the project itself (fast — deps are already resolved above).
+# --no-dev drops the pytest/httpx/ruff dependency group: a deployed web
+# service has no use for a test runner, and the group is resolved in
+# uv.lock either way, so --frozen stays satisfied.
+RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
 

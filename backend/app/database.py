@@ -6,7 +6,7 @@ Supports environment variable DATABASE_URL for deployment (e.g. Render, Railway,
 import os
 from typing import Generator, Optional
 
-from sqlmodel import Session, SQLModel, create_engine, select
+from sqlmodel import Session, create_engine, select
 
 from app_settings import settings
 from models import (
@@ -48,23 +48,47 @@ def get_session() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Create all SQLModel tables in PostgreSQL and sync enums."""
-    SQLModel.metadata.create_all(engine)
-    try:
-        from sqlalchemy import text
+    """
+    Bring the schema to head by running the Alembic migration chain.
 
-        with engine.connect() as conn:
-            conn.execute(
-                text(
-                    "ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'TIME_WINDOW_CHANGE'"
-                )
-            )
-            conn.execute(
-                text("ALTER TYPE vehiclestatus ADD VALUE IF NOT EXISTS 'NOTACTIVATED'")
-            )
-            conn.commit()
-    except Exception:
-        pass
+    This used to be `SQLModel.metadata.create_all(engine)` plus a best-effort
+    `ALTER TYPE ... ADD VALUE` block wrapped in a bare `except: pass`. Both were
+    wrong, in ways that only showed up later:
+
+      * create_all and Alembic are two owners of the same schema. Whichever ran
+        first created the tables, and the other then failed — create_all with
+        "relation already exists" the moment anyone ran `alembic upgrade head`
+        against a database an app had already booted against.
+      * The bare `except: pass` swallowed every failure, including a wrong DSN
+        and a missing `eventtype`. An enum value that silently failed to be
+        added is an insert error waiting to happen, reported from wherever it
+        eventually surfaces rather than from the migration that should have
+        added it.
+
+    The 0001_baseline migration creates the enum types complete, so there is
+    nothing left to patch up here. From this point on the rule is: the schema
+    changes by adding a migration, and this function is the only thing that
+    applies one.
+
+    Runs in-process at startup rather than as a separate deploy step, which
+    keeps `uvicorn main:app` a sufficient start command. The cost is that two
+    processes booting against an empty database at the same instant can both
+    decide to apply 0001 and the loser fails on "relation already exists".
+    Postgres DDL is transactional, so this only bites when the api and worker
+    containers start simultaneously against a brand-new volume; if that becomes
+    a real failure rather than a theoretical one, the fix is a Postgres advisory
+    lock around the upgrade, not a removal of this call.
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    # alembic.ini is the single source of truth for the migrations location: it
+    # uses `%(here)s/migrations`, which resolves relative to the ini file itself,
+    # so the app works regardless of the process's working directory.
+    ini_path = Path(__file__).resolve().parent / "alembic.ini"
+    command.upgrade(Config(str(ini_path)), "head")
 
 
 # ---------------------------------------------------------------------------

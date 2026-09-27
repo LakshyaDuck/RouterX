@@ -8,6 +8,7 @@ travel costs are computed directly (Euclidean distance — see
 distance_matrix.py) rather than fetched from a real-road-network router.
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import redis.asyncio as redis
@@ -21,9 +22,33 @@ from app_settings import settings
 from database import engine, get_fleet_state, get_session, init_db
 from models import FleetState
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Startup: apply migrations, then hand over to the request handlers.
+
+    A lifespan handler rather than `@app.on_event("startup")`, which FastAPI has
+    deprecated. Beyond the warning, the difference that matters is ordering
+    against the SSE stream: `on_event` handlers are registered per-event and
+    are easy to end up running after the first request is already being served,
+    whereas everything here completes before the app accepts traffic.
+
+    init_db() runs the Alembic chain. It is the only thing that touches the
+    schema — see its docstring for why create_all was removed.
+    """
+    init_db()
+    yield
+    # Nothing to tear down: the SQLAlchemy engine pools connections and is
+    # process-scoped, and the Redis client is closed by its own GC. Both would
+    # need explicit disposal here only if this app were embedded in a longer-
+    # lived process that restarts the app without restarting the interpreter.
+
+
 app = FastAPI(
     title="VRP Real-Time System",
     version="0.1.0",
+    lifespan=lifespan,
     openapi_tags=[
         {"name": "general", "description": "Service metadata and home page data."},
         {"name": "fleet", "description": "Live fleet state read from Postgres."},
@@ -216,12 +241,3 @@ async def stream_events():
             await pubsub.unsubscribe("route-updates")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-
-@app.on_event("startup")
-async def on_startup():
-    # Delegates to database.init_db(), which creates tables from SQLModel
-    # metadata and syncs the Postgres enum types. Once Alembic owns the
-    # schema, this goes away entirely — Alembic becomes the only thing that
-    # touches it.
-    init_db()

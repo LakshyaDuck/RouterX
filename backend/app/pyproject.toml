@@ -23,6 +23,59 @@ dependencies = [
     "pydantic-settings>=2.6.0",
 ]
 
+[dependency-groups]
+# Dev-only. Installed by `uv sync` locally, excluded from the production image
+# by the `--no-dev` flag in the Dockerfile — a test runner has no business in a
+# deployed web service.
+dev = [
+    "pytest>=8.0.0",
+    # FastAPI's TestClient is built on httpx, so this is a test-only dependency
+    # even though it looks like a web-framework one.
+    "httpx>=0.27.0",
+    "ruff>=0.6.0",
+]
+
+[tool.pytest.ini_options]
+# The app modules (main, models, database) are imported as TOP-LEVEL names, not
+# as `app.models` — the Dockerfile copies backend/app to /app and runs
+# `uvicorn main:app`. Tests must import them the same way, so rootdir goes on
+# the path rather than pretending backend/app is a package.
+pythonpath = ["."]
+testpaths = ["tests"]
+# `-q` in the Makefile keeps the output to one line per phase. `--strict-markers`
+# turns an unregistered `@pytest.mark.slow` into an error instead of a silent
+# no-op, which is how a "skipped" test suite starts lying to you.
+addopts = "--strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]
+# The ported Routerpriv8 code uses `Optional[...]` in annotations and
+# `class VehicleStatus(str, Enum)` for the status enums. pyupgrade ("UP") would
+# flag both — 11 hits in models.py alone, and every function signature coming
+# across in Phases 2-5. Enabling it now would mean rewriting annotations that
+# the port is about to overwrite, and StrEnum is not a drop-in for SQLModel's
+# SAEnum mapping. Modernising the annotations is a real task; it is just not
+# this one, and folding it into a baseline commit would hide it.
+#
+# E402 is still reported but silenced per-site in migrations/env.py, where
+# Alembic's own template requires imports to follow config setup.
+ignore = [
+    "E501",   # line length is handled by the formatter, not the linter
+    "B008",   # FastAPI's Depends()/Query() in defaults is the documented idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic's env.py template requires `config.set_main_option(...)` to run before
+# the model imports it depends on, which is inherently a mid-file import (E402)
+# and inherently not in isort's order (I001). Both are load-bearing here, so the
+# exception is declared once, in the config, instead of as inline suppressions
+# that a future reader has to notice are deliberate.
+"migrations/env.py" = ["E402", "I001"]
+
 [tool.uv]
 # locked resolution — this is what uv.lock captures, and what
 # `uv sync --frozen` in the Dockerfile installs exactly, byte-for-byte

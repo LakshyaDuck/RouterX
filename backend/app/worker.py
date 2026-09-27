@@ -10,6 +10,7 @@ writes the result back to Postgres -> publishes the update over SSE.
 """
 
 from arq.connections import RedisSettings
+
 from app_settings import settings
 
 

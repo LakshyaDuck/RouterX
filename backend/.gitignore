@@ -1,4 +1,11 @@
+# `.venv-user/` is the writable venv used on this machine: the checked-in
+# `.venv/` is root-owned and `uv sync` cannot replace it without sudo. It is
+# kept in the repo (not in $HOME) so the compose bind-mount of ./app still
+# sees it. The container builds its own venv at /app/.venv and is unaffected.
 .venv/
+.venv-user/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
 .env
