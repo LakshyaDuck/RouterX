@@ -1,4 +1,9 @@
 node_modules
 dist
-.git
+dist-ssr
 .env
+.env.*
+!.env.example
+.git
+.gitignore
+README.md

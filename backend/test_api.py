@@ -1,0 +1,12 @@
+import urllib.request, json, os
+BASE_URL = os.getenv("TEST_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+r = urllib.request.urlopen(f"{BASE_URL}/api/state")
+data = json.loads(r.read())
+print("Vehicles:", len(data["vehicles"]))
+print("Deliveries:", len(data["deliveries"]))
+print("Nodes:", len(data["nodes"]))
+print("Roads:", len(data["roads"]))
+print("Routes:", len(data["routes"]))
+print("Sample vehicle:", data["vehicles"][0]["name"], "-", data["vehicles"][0]["status"])
+print("Sample delivery:", data["deliveries"][0]["id"], "->", data["deliveries"][0]["location"], "priority:", data["deliveries"][0]["priority"])
+print("\nAPI /state: OK")
