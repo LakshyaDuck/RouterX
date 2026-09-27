@@ -4,35 +4,41 @@ Supports environment variable DATABASE_URL for deployment (e.g. Render, Railway,
 """
 
 import os
-import logging
 from typing import Generator, Optional
-from sqlmodel import SQLModel, create_engine, Session, select
 
-from app.models import (
-    Vehicle, Delivery, Node, Road, Route, Event,
-    SimulationMetadata, FleetState, VehicleStatus, DeliveryStatus
-)
-from app.time_utils import get_current_local_iso, to_datetime
-from app.config import (
-    DATABASE_URL, DB_POOL_SIZE, DB_MAX_OVERFLOW,
-    DB_POOL_RECYCLE, DB_POOL_PRE_PING, LOG_LEVEL
-)
+from sqlmodel import Session, create_engine, select
 
-logger = logging.getLogger("routerx.database")
+from app_settings import settings
+from models import (
+    Delivery,
+    Event,
+    FleetState,
+    Node,
+    Road,
+    Route,
+    SimulationMetadata,
+    Vehicle,
+)
 
 # ---------------------------------------------------------------------------
 # Database URL configuration
 # ---------------------------------------------------------------------------
 
-# Connection engine with pre-ping, connection pooling, and connection recycling
-engine = create_engine(
-    DATABASE_URL,
-    echo=(LOG_LEVEL == "DEBUG"),
-    pool_pre_ping=DB_POOL_PRE_PING,
-    pool_size=DB_POOL_SIZE,
-    max_overflow=DB_MAX_OVERFLOW,
-    pool_recycle=DB_POOL_RECYCLE,
-)
+DATABASE_URL = os.getenv("DATABASE_URL") or settings.postgres_dsn
+
+# Normalize the scheme so this works with whatever URL format the host
+# injects. Render/Heroku/AWS hand out `postgres://` or a bare `postgresql://`
+# with no driver suffix, and SQLAlchemy then defaults to psycopg2 — which is
+# NOT installed here. This project is on psycopg3. Pinning the driver
+# explicitly is what keeps that from becoming a ModuleNotFoundError at
+# startup rather than a connection error.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://") :]
+if DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = "postgresql+psycopg://" + DATABASE_URL[len("postgresql://") :]
+
+# Connection engine with pre-ping to ensure active connection
+engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -42,31 +48,59 @@ def get_session() -> Generator[Session, None, None]:
 
 
 def init_db() -> None:
-    """Create all SQLModel tables in PostgreSQL and sync enums and columns."""
-    SQLModel.metadata.create_all(engine)
-    try:
-        from sqlalchemy import text
-        with engine.connect() as conn:
-            conn.execute(text("ALTER TYPE eventtype ADD VALUE IF NOT EXISTS 'TIME_WINDOW_CHANGE'"))
-            conn.execute(text("ALTER TYPE vehiclestatus ADD VALUE IF NOT EXISTS 'NOTACTIVATED'"))
-            conn.execute(text("ALTER TYPE deliverystatus ADD VALUE IF NOT EXISTS 'CANCELLED'"))
-            conn.execute(text("ALTER TABLE simulationmetadata ADD COLUMN IF NOT EXISTS simulation_start_time VARCHAR DEFAULT '';"))
-            conn.execute(text("ALTER TABLE simulationmetadata ADD COLUMN IF NOT EXISTS is_running BOOLEAN DEFAULT FALSE;"))
-            conn.execute(text("ALTER TABLE simulationmetadata ADD COLUMN IF NOT EXISTS speed_multiplier FLOAT DEFAULT 1.0;"))
-            conn.commit()
-    except Exception as e:
-        logger.debug("Schema migration sync check completed: %s", e)
+    """
+    Bring the schema to head by running the Alembic migration chain.
 
+    This used to be `SQLModel.metadata.create_all(engine)` plus a best-effort
+    `ALTER TYPE ... ADD VALUE` block wrapped in a bare `except: pass`. Both were
+    wrong, in ways that only showed up later:
+
+      * create_all and Alembic are two owners of the same schema. Whichever ran
+        first created the tables, and the other then failed — create_all with
+        "relation already exists" the moment anyone ran `alembic upgrade head`
+        against a database an app had already booted against.
+      * The bare `except: pass` swallowed every failure, including a wrong DSN
+        and a missing `eventtype`. An enum value that silently failed to be
+        added is an insert error waiting to happen, reported from wherever it
+        eventually surfaces rather than from the migration that should have
+        added it.
+
+    The 0001_baseline migration creates the enum types complete, so there is
+    nothing left to patch up here. From this point on the rule is: the schema
+    changes by adding a migration, and this function is the only thing that
+    applies one.
+
+    Runs in-process at startup rather than as a separate deploy step, which
+    keeps `uvicorn main:app` a sufficient start command. The cost is that two
+    processes booting against an empty database at the same instant can both
+    decide to apply 0001 and the loser fails on "relation already exists".
+    Postgres DDL is transactional, so this only bites when the api and worker
+    containers start simultaneously against a brand-new volume; if that becomes
+    a real failure rather than a theoretical one, the fix is a Postgres advisory
+    lock around the upgrade, not a removal of this call.
+    """
+    from pathlib import Path
+
+    from alembic import command
+    from alembic.config import Config
+
+    # alembic.ini is the single source of truth for the migrations location: it
+    # uses `%(here)s/migrations`, which resolves relative to the ini file itself,
+    # so the app works regardless of the process's working directory.
+    ini_path = Path(__file__).resolve().parent / "alembic.ini"
+    command.upgrade(Config(str(ini_path)), "head")
 
 
 # ---------------------------------------------------------------------------
 # State Query & Persistence Helpers
 # ---------------------------------------------------------------------------
 
+
 def has_fleet_data(session: Optional[Session] = None) -> bool:
-    """Check if the network/fleet database is initialized."""
+    """Check if vehicles/deliveries are already seeded in the database."""
+
     def _check(s: Session) -> bool:
-        stmt = select(Node).limit(1)
+        stmt = select(Vehicle).limit(1)
         return s.exec(stmt).first() is not None
 
     if session is not None:
@@ -84,6 +118,7 @@ def save_initial_fleet_state(
     session: Optional[Session] = None,
 ) -> None:
     """Seed initial fleet state into PostgreSQL."""
+
     def _save(s: Session) -> None:
         for n in nodes:
             s.merge(n)
@@ -97,13 +132,7 @@ def save_initial_fleet_state(
             s.merge(rt)
         # Initialize simulation metadata if not present
         if not s.get(SimulationMetadata, "global"):
-            s.add(SimulationMetadata(
-                id="global",
-                simulation_time=0.0,
-                simulation_start_time=get_current_local_iso(),
-                is_running=False,
-                speed_multiplier=1.0,
-            ))
+            s.add(SimulationMetadata(id="global", simulation_time=0.0))
         s.commit()
 
     if session is not None:
@@ -113,8 +142,85 @@ def save_initial_fleet_state(
             _save(s)
 
 
+def seed_fleet_state(session: Optional[Session] = None) -> bool:
+    """
+    Insert the deterministic demo scenario if — and only if — the fleet is empty.
+
+    Returns True if data was written, False if the database already had a fleet.
+
+    Two properties this is careful about:
+
+      * It never overwrites. `has_fleet_data()` is checked first, and the whole
+        write goes through `save_initial_fleet_state`, which merges by primary
+        key. Seeding is a bootstrap step, not a reset — restarting the API
+        against a database that a user has been experimenting on must not
+        silently restore the demo city over their changes. That is what
+        `make reset-db` and the Phase 5/6 simulation endpoints are for.
+
+      * It validates before it writes. `validate_demo_scenario()` returning
+        non-empty raises rather than seeding. A half-valid scenario is worse
+        than an unseeded one: the check exists precisely because the failure
+        mode of hand-authored fixture data is a database that seeds cleanly and
+        is subtly wrong, and a raise at bootstrap is the last cheap moment to
+        notice.
+
+    One empty Route per vehicle is seeded alongside, rather than waiting for the
+    optimizer in Phase 3 to create them. Route.vehicle_id is the primary key, so
+    "one route per vehicle" is a 1:1 invariant that holds from the first commit
+    rather than from whenever the optimizer happened to land. The rows are
+    zeroed placeholders — no stops, no distance — and Phase 3 overwrites them
+    with a real plan. Seeding none would leave `/fleet/state` reporting
+    `routes: []` for a phase, which reads as "the optimizer found nothing"
+    rather than "the optimizer does not exist yet".
+    """
+    from demo_scenario import (
+        build_demo_deliveries,
+        build_demo_nodes,
+        build_demo_roads,
+        build_demo_vehicles,
+        validate_demo_scenario,
+    )
+
+    problems = validate_demo_scenario()
+    if problems:
+        raise ValueError(
+            "demo scenario failed validation, refusing to seed:\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    def _seed(s: Session) -> bool:
+        if has_fleet_data(s):
+            return False
+        vehicles = build_demo_vehicles()
+        save_initial_fleet_state(
+            vehicles=vehicles,
+            deliveries=build_demo_deliveries(),
+            nodes=build_demo_nodes(),
+            roads=build_demo_roads(),
+            routes=[
+                Route(
+                    vehicle_id=vehicle.id,
+                    delivery_ids=[],
+                    total_distance=0.0,
+                    total_travel_time=0.0,
+                    total_load=0.0,
+                    feasible=True,
+                )
+                for vehicle in vehicles
+            ],
+            session=s,
+        )
+        return True
+
+    if session is not None:
+        return _seed(session)
+    with Session(engine) as s:
+        return _seed(s)
+
+
 def get_fleet_state(session: Optional[Session] = None) -> FleetState:
-    """Retrieve full fleet state from PostgreSQL, dynamically time-aware."""
+    """Retrieve full fleet state from PostgreSQL."""
+
     def _query(s: Session) -> FleetState:
         vehicles = list(s.exec(select(Vehicle)).all())
         deliveries = list(s.exec(select(Delivery)).all())
@@ -124,92 +230,6 @@ def get_fleet_state(session: Optional[Session] = None) -> FleetState:
         events = list(s.exec(select(Event).order_by(Event.timestamp.asc())).all())
         meta = s.get(SimulationMetadata, "global")
         sim_time = meta.simulation_time if meta else 0.0
-        start_time_iso = (meta.simulation_start_time if meta and meta.simulation_start_time else "") or get_current_local_iso()
-        is_running = meta.is_running if meta else False
-        speed_mult = meta.speed_multiplier if meta else 1.0
-
-        if meta and not meta.simulation_start_time:
-            meta.simulation_start_time = start_time_iso
-            s.add(meta)
-            s.commit()
-
-        # Dynamically determine time-dependent vehicle positions and delivery lifecycle
-        if routes and vehicles and deliveries and nodes and roads:
-            try:
-                from app.optimizer import simulate_route_timeline
-                from app.routing import build_graph
-
-                graph = build_graph(nodes, roads)
-                deliveries_dict = {d.id: d for d in deliveries}
-                SERVICE_TIME = 5.0
-
-                for r in routes:
-                    v = next((veh for veh in vehicles if veh.id == r.vehicle_id), None)
-                    if not v or getattr(v.status, "value", v.status) == "BREAKDOWN":
-                        continue
-
-                    sim = simulate_route_timeline(r.delivery_ids, v, deliveries_dict, graph, service_time=SERVICE_TIME, start_time=0.0)
-                    arrival_times = sim.get("arrival_times", {})
-
-                    curr_loc = "depot"
-                    for did in r.delivery_ids:
-                        d = deliveries_dict.get(did)
-                        if not d:
-                            continue
-                        arr_t = arrival_times.get(did)
-                        if arr_t is None:
-                            continue
-                        serv_start = max(arr_t, d.time_window_start)
-                        serv_end = serv_start + SERVICE_TIME
-
-                        # Time-aware delivery lifecycle
-                        if getattr(d.status, "value", d.status) != "CANCELLED":
-                            if sim_time < arr_t:
-                                d.status = DeliveryStatus.PENDING
-                            elif arr_t <= sim_time < serv_end:
-                                d.status = DeliveryStatus.IN_PROGRESS
-                                curr_loc = d.location
-                            elif sim_time >= serv_end:
-                                d.status = DeliveryStatus.DELIVERED
-                                curr_loc = d.location
-
-                    final_ret = sim.get("final_return_time", 0.0)
-                    if sim_time >= final_ret and r.delivery_ids:
-                        curr_loc = "depot"
-
-                    v.current_location = curr_loc
-            except Exception:
-                pass
-
-        from app.optimizer import compute_fleet_metrics
-        fleet_metrics = compute_fleet_metrics(routes, vehicles, deliveries, nodes, roads)
-
-        active_veh = sum(1 for v in vehicles if getattr(v.status, "value", v.status) == "ACTIVE")
-        broken_veh = sum(1 for v in vehicles if getattr(v.status, "value", v.status) == "BREAKDOWN")
-        pending_del = sum(1 for d in deliveries if getattr(d.status, "value", d.status) == "PENDING")
-        delivered = sum(1 for d in deliveries if getattr(d.status, "value", d.status) == "DELIVERED")
-
-        metrics = {
-            "total_distance": fleet_metrics["total_distance"],
-            "total_travel_time": fleet_metrics["total_travel_time"],
-            "total_vehicles": len(vehicles),
-            "active_vehicles": active_veh,
-            "broken_vehicles": broken_veh,
-            "total_deliveries": len(deliveries),
-            "pending_deliveries": pending_del,
-            "completed_deliveries": delivered,
-            "total_violations": fleet_metrics["total_violations"],
-            "capacity_violations": fleet_metrics["capacity_violations"],
-            "time_window_violations": fleet_metrics["time_window_violations"],
-            "driver_hour_violations": fleet_metrics["driver_hour_violations"],
-            "assignment_violations": fleet_metrics["assignment_violations"],
-            "unreachable_routes": fleet_metrics["unreachable_routes"],
-            "failed_deliveries": fleet_metrics["failed_deliveries"],
-            "unassigned_deliveries": fleet_metrics["unassigned_deliveries"],
-            "infeasible_routes": fleet_metrics["infeasible_routes"],
-            "route_violations": fleet_metrics["total_violations"],
-            "violations": fleet_metrics["violations"],
-        }
 
         return FleetState(
             vehicles=vehicles,
@@ -219,17 +239,28 @@ def get_fleet_state(session: Optional[Session] = None) -> FleetState:
             routes=routes,
             events=events,
             simulation_time=sim_time,
-            simulation_start_time=start_time_iso,
-            current_simulation_time=to_datetime(start_time_iso, sim_time).isoformat(),
-            is_running=is_running,
-            speed_multiplier=speed_mult,
-            metrics=metrics,
         )
 
     if session is not None:
         return _query(session)
     with Session(engine) as s:
         return _query(s)
+
+
+def build_city_graph(state: FleetState):
+    """
+    Build a routing graph from a loaded ``FleetState``.
+
+    The single seam between the database and ``routing.py``: callers that need
+    travel times hand over the state they already have rather than re-querying
+    the city, and the graph is rebuilt whenever roads change rather than being
+    mutated in place. ``CityGraph`` memoises its Dijkstra runs and assumes an
+    unchanging edge set, so a new graph per change is the intended usage — at
+    25 nodes and 45 roads it costs microseconds.
+    """
+    from routing import build_graph
+
+    return build_graph(state.nodes, state.roads)
 
 
 def get_vehicles(session: Optional[Session] = None) -> list[Vehicle]:
@@ -285,222 +316,3 @@ def append_event(event: Event, session: Optional[Session] = None) -> None:
     else:
         with Session(engine) as s:
             _add(s)
-
-
-def reset_fleet_database(session: Optional[Session] = None, start_time: Optional[str] = None) -> FleetState:
-    """
-    Reset PostgreSQL database to the fixed deterministic demo scenario:
-      - 8 vehicles
-      - 40 deliveries
-      - 25 nodes
-      - 45 roads
-      - Initial feasible routes computed deterministically
-    """
-    from simulation.demo_scenario import get_demo_scenario
-    from app.optimizer import generate_initial_plan
-    from sqlalchemy import text
-
-    def _reset(s: Session) -> FleetState:
-        # Delete existing records in dependency order
-        s.execute(text("DELETE FROM event;"))
-        s.execute(text("DELETE FROM route;"))
-        s.execute(text("DELETE FROM delivery;"))
-        s.execute(text("DELETE FROM vehicle;"))
-        s.execute(text("DELETE FROM road;"))
-        s.execute(text("DELETE FROM node;"))
-        s.commit()
-
-        sc = get_demo_scenario()
-        nodes = sc["nodes"]
-        roads = sc["roads"]
-        vehicles = sc["vehicles"]
-        deliveries = sc["deliveries"]
-
-        # Generate deterministic initial fleet plan
-        plan = generate_initial_plan(vehicles, deliveries, nodes, roads)
-
-        # Merge all into database
-        for n in nodes:
-            s.merge(n)
-        for r in roads:
-            s.merge(r)
-        for v in vehicles:
-            s.merge(v)
-        for d in deliveries:
-            s.merge(d)
-        for rt in plan.routes:
-            s.merge(rt)
-
-        meta = s.get(SimulationMetadata, "global")
-        if not meta:
-            s.add(SimulationMetadata(
-                id="global",
-                simulation_time=0.0,
-                simulation_start_time=start_time or get_current_local_iso(),
-                is_running=False,
-                speed_multiplier=1.0,
-            ))
-        else:
-            meta.simulation_time = 0.0
-            meta.simulation_start_time = start_time or get_current_local_iso()
-            meta.is_running = False
-            meta.speed_multiplier = 1.0
-            s.add(meta)
-        s.commit()
-
-        return get_fleet_state(s)
-
-    if session is not None:
-        return _reset(session)
-    with Session(engine) as s:
-        return _reset(s)
-
-
-def fresh_fleet_database(session: Optional[Session] = None, start_time: Optional[str] = None) -> FleetState:
-    """
-    Clear the current operational scenario to an empty slate:
-      - 0 vehicles
-      - 0 deliveries
-      - 0 routes
-      - 0 events
-      - Preserves underlying network infrastructure (nodes, depot, roads)
-      - Resets roads to normal traffic (1.0) and unblocked (False)
-      - Resets simulation start time to current/specified local time
-    """
-    from simulation.demo_scenario import get_demo_scenario
-    from sqlalchemy import text
-
-    def _fresh(s: Session) -> FleetState:
-        s.execute(text("DELETE FROM event;"))
-        s.execute(text("DELETE FROM route;"))
-        s.execute(text("DELETE FROM delivery;"))
-        s.execute(text("DELETE FROM vehicle;"))
-        s.execute(text("UPDATE road SET traffic_multiplier = 1.0, blocked = false;"))
-
-        # Ensure core network nodes and roads are present
-        existing_nodes = list(s.exec(select(Node)).all())
-        existing_roads = list(s.exec(select(Road)).all())
-        if not existing_nodes or not existing_roads:
-            sc = get_demo_scenario()
-            for n in sc["nodes"]:
-                s.merge(n)
-            for r in sc["roads"]:
-                s.merge(r)
-
-        meta = s.get(SimulationMetadata, "global")
-        if not meta:
-            s.add(SimulationMetadata(
-                id="global",
-                simulation_time=0.0,
-                simulation_start_time=start_time or get_current_local_iso(),
-                is_running=False,
-                speed_multiplier=1.0,
-            ))
-        else:
-            meta.simulation_time = 0.0
-            meta.simulation_start_time = start_time or get_current_local_iso()
-            meta.is_running = False
-            meta.speed_multiplier = 1.0
-            s.add(meta)
-        s.commit()
-
-        return get_fleet_state(s)
-
-    if session is not None:
-        return _fresh(session)
-    with Session(engine) as s:
-        return _fresh(s)
-
-
-def set_simulation_clock(
-    sim_time: float,
-    start_time: Optional[str] = None,
-    session: Optional[Session] = None,
-) -> FleetState:
-    """Set the authoritative simulation clock to a specified elapsed minute or start time."""
-    def _set(s: Session) -> FleetState:
-        meta = s.get(SimulationMetadata, "global")
-        target_mins = max(0.0, float(sim_time))
-        if not meta:
-            meta = SimulationMetadata(
-                id="global",
-                simulation_time=target_mins,
-                simulation_start_time=start_time or get_current_local_iso(),
-                is_running=False,
-                speed_multiplier=1.0,
-            )
-            s.add(meta)
-        else:
-            meta.simulation_time = target_mins
-            if start_time:
-                meta.simulation_start_time = start_time
-            s.add(meta)
-        s.commit()
-        return get_fleet_state(s)
-
-    if session is not None:
-        return _set(session)
-    with Session(engine) as s:
-        return _set(s)
-
-
-def advance_simulation_clock(
-    minutes: float,
-    session: Optional[Session] = None,
-) -> FleetState:
-    """Advance or rewind the simulation clock by a delta number of minutes."""
-    def _adv(s: Session) -> FleetState:
-        meta = s.get(SimulationMetadata, "global")
-        delta = float(minutes)
-        if not meta:
-            meta = SimulationMetadata(
-                id="global",
-                simulation_time=max(0.0, delta),
-                simulation_start_time=get_current_local_iso(),
-                is_running=False,
-                speed_multiplier=1.0,
-            )
-            s.add(meta)
-        else:
-            meta.simulation_time = max(0.0, meta.simulation_time + delta)
-            s.add(meta)
-        s.commit()
-        return get_fleet_state(s)
-
-    if session is not None:
-        return _adv(session)
-    with Session(engine) as s:
-        return _adv(s)
-
-
-def control_simulation_clock(
-    is_running: bool,
-    speed_multiplier: Optional[float] = None,
-    session: Optional[Session] = None,
-) -> FleetState:
-    """Pause, resume, or adjust the speed multiplier of the simulation clock."""
-    def _ctrl(s: Session) -> FleetState:
-        meta = s.get(SimulationMetadata, "global")
-        if not meta:
-            meta = SimulationMetadata(
-                id="global",
-                simulation_time=0.0,
-                simulation_start_time=get_current_local_iso(),
-                is_running=is_running,
-                speed_multiplier=float(speed_multiplier or 1.0),
-            )
-            s.add(meta)
-        else:
-            meta.is_running = is_running
-            if speed_multiplier is not None:
-                meta.speed_multiplier = max(0.1, float(speed_multiplier))
-            s.add(meta)
-        s.commit()
-        return get_fleet_state(s)
-
-    if session is not None:
-        return _ctrl(session)
-    with Session(engine) as s:
-        return _ctrl(s)
-
-
